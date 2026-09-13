@@ -1,380 +1,145 @@
-# AI Support Agent — Step 1: Order Lookup
+# 🤖 AI Support Agent
 
-This is the first building block of the AI Customer Support Agent project.
-No AI yet — just a working backend with a real database, so the foundation
-is solid before we add the smart parts.
+An AI-powered customer support agent for an online store — it doesn't just chat, it **takes real actions**: looking up live order data and searching real company policy documents using semantic search, instead of guessing.
 
-## What this does
+Built end-to-end as a hands-on learning project: from a plain FastAPI backend, through tool-calling AI agents, real RAG with a vector database, graph-based agent orchestration, and full Docker containerization.
 
-- Stores customers and orders in a database
-- Lets you look up an order by ID and get its status back
+*(See [BUILD_LOG.md](BUILD_LOG.md) for the step-by-step journey this was built in, including the real bugs hit and fixed along the way.)*
 
-## How to run it
+---
 
-1. Install the dependencies:
-   ```
-   pip install -r requirements.txt
-   ```
+## ✨ What it does
 
-2. Fill the database with some fake test data:
-   ```
-   python seed.py
-   ```
+- **Order tracking** — "Where is my order #4582?" → looks up the real order in PostgreSQL/SQLite and replies with live status, product, and delivery date
+- **Policy Q&A (semantic RAG)** — "What happens if my package shows up broken?" → finds the right policy passage using *meaning*, not just keyword matching (this phrase shares no words with the actual policy text, yet it correctly retrieves the refund policy)
+- **Honest about limits** — if an order doesn't exist, it says so — it never invents order details or policy rules
+- **Natural conversation** — handles greetings and small talk normally, without forcing a tool call every time
 
-3. Start the server:
-   ```
-   uvicorn main:app --reload
-   ```
+The AI decides, per message, whether it needs a tool — and if so, which one — through an explicit LangGraph agent graph.
 
-4. Open your browser to:
-   ```
-   http://127.0.0.1:8000/docs
-   ```
-   This gives you an interactive page where you can try the endpoints
-   without writing any code.
+---
 
-5. Try looking up order `4582`, `4583`, or `4584` (these come from
-   `seed.py`). Try a number that doesn't exist too, like `9999`, to see
-   the "not found" response.
+## 🧠 Architecture
 
-## Files in this step
-
-| File | What it's for |
-|---|---|
-| `database.py` | Connects to the database (SQLite for now — easy to switch to Postgres later) |
-| `models.py` | Defines the `Customer` and `Order` tables |
-| `seed.py` | Fills the database with fake test data |
-| `main.py` | The actual API — this is what runs |
-
-## Step 2: AI Chat (new!)
-
-Now there's a `/chat` endpoint. Type a plain-English question and the
-AI decides on its own whether it needs to look up an order.
-
-### Setup
-
-1. Copy `.env.example` to a new file called `.env`
-2. Get a free Groq API key from https://console.groq.com/keys
-3. Paste it into `.env` so it looks like:
-   ```
-   GROQ_API_KEY=gsk_your_actual_key_here
-   ```
-4. Install the new dependencies:
-   ```
-   pip install -r requirements.txt
-   ```
-5. Restart the server:
-   ```
-   uvicorn main:app --reload
-   ```
-6. Go to http://127.0.0.1:8000/docs, open **POST /chat**, click
-   "Try it out", and send:
-   ```
-   { "message": "where is my order 4582?" }
-   ```
-
-### New files in this step
-
-| File | What it's for |
-|---|---|
-| `tools.py` | The order-lookup function, plus a description of it that the AI can understand |
-| `chat.py` | Sends your message to Groq, lets it decide whether to use the tool, and gets back a natural-language answer |
-| `.env.example` | Template for your API key — copy it to `.env` and fill in your real key |
-
-## What's next (Step 3)
-
-Add RAG: feed the AI a couple of policy documents (return policy,
-shipping policy) so it can answer questions like "can I return this
-after 20 days?" using real company rules instead of guessing.
-
-## Step 3: RAG for policy questions (new!)
-
-The AI can now answer questions about returns, refunds, and shipping
-by actually searching real policy documents instead of guessing.
-
-### What's new
-
-- `policies/` folder — three plain-text policy documents (you can add
-  your own or edit these)
-- `rag.py` — splits those documents into paragraphs and finds the
-  most relevant ones for any question (this is the "R" in RAG:
-  Retrieval)
-- `tools.py` — now has a second tool, `search_policy`, that the AI
-  can call
-- `chat.py` — updated so the AI knows it has two tools now, and knows
-  to use `search_policy` for policy questions
-
-### How this version of RAG works (simplified)
-
-Real RAG systems (like your PolicyBot) use AI-generated embeddings
-and a vector database (ChromaDB, pgvector, etc). To keep this step
-lighter, this version uses TF-IDF (from scikit-learn) instead — it
-measures word overlap rather than true meaning, so it's less
-powerful, but needs no extra downloads or API calls, and teaches the
-same core idea: **break documents into chunks → find the most
-relevant chunk for a question → give that chunk to the AI as
-context.**
-
-A natural next upgrade (not required, just an idea for later) is
-swapping `rag.py` to use HuggingFace embeddings and a real vector
-database, the same combo you used in PolicyBot.
-
-### Try it
-
-Restart the server (`uvicorn main:app --reload`) and send:
 ```
-{ "message": "can I return an item after 20 days?" }
-{ "message": "how much does shipping cost?" }
-{ "message": "my order arrived damaged, what do I do?" }
+User message
+     │
+     ▼
+FastAPI  /chat  endpoint
+     │
+     ▼
+┌─────────────────────────────────────────┐
+│           LangGraph agent graph          │
+│                                           │
+│   START ──► [agent] ──(needs a tool?)──► [tools]
+│                │                              │
+│                │◄─────────────────────────────┘
+│                ▼
+│              END (final answer)
+└─────────────────────────────────────────┘
+     │
+     ├── lookup_order(order_id)  ───────► PostgreSQL/SQLite (orders)
+     │
+     └── search_policy(query)   ───────► pgvector (semantic search over
+                                           embedded policy documents)
+     │
+     ▼
+Natural-language reply, grounded in real data
+     │
+     ▼
+Custom chat UI
 ```
 
-### New/changed files in this step
+This is a real (if intentionally scoped-down) example of **graph-based agent orchestration**: an LLM reasons over user intent, calls the right tool with the right arguments via an explicit state graph, and grounds its final answer in what the tool actually returned.
 
-| File | What it's for |
+---
+
+## 🛠️ Tech stack
+
+| Layer | Technology |
 |---|---|
-| `policies/*.txt` | The actual policy documents to search |
-| `rag.py` | Splits documents into chunks and finds the best match for a question |
-| `tools.py` | Now also describes the `search_policy` tool to the AI |
-| `chat.py` | Now routes to whichever tool the AI picks |
+| Backend API | FastAPI |
+| Orders database | SQLAlchemy + SQLite |
+| Agent orchestration | **LangGraph** (explicit graph: agent node ↔ tools node) |
+| LLM | Groq API (`openai/gpt-oss-120b`) via `langchain-groq` |
+| RAG — embeddings | HuggingFace `sentence-transformers` (`all-MiniLM-L6-v2`) |
+| RAG — vector store | **PostgreSQL + pgvector** (real semantic similarity search) |
+| Containerization | **Docker** + Docker Compose (2 services: app + Postgres) |
+| Frontend | Vanilla HTML/CSS/JavaScript, custom-designed (no framework) |
 
-## What's next (Step 4)
+---
 
-Wrap this up with a simple chat page (HTML/JS) so you can demo it in
-a browser instead of the `/docs` page, then push the whole thing to
-GitHub with a clear README.
+## 📂 Project structure
 
-## Step 4: A real chat page (new!)
+```
+support_agent/
+├── main.py                   # FastAPI app: routes for /, /health, /orders/{id}, /chat
+├── database.py                # SQLAlchemy connection setup (orders DB)
+├── models.py                   # Customer & Order table definitions
+├── seed.py                      # Populates the orders database with sample data
+├── tools.py                      # Plain functions the AI can call (lookup_order, search_policy)
+├── chat.py                        # LangGraph agent: builds the graph, runs the conversation
+├── chat_manual_backup.py           # Earlier hand-rolled tool-calling loop (kept for comparison)
+├── rag.py                           # Embeds policy docs + queries pgvector for semantic search
+├── rag_tfidf_backup.py               # Earlier TF-IDF version of RAG (kept for comparison)
+├── policies/                          # Return / shipping / refund policy text files
+├── static/index.html                   # The chat UI
+├── Dockerfile                           # Builds the app image (CPU-only PyTorch, no GPU bloat)
+├── docker-compose.yml                    # Runs the app + a pgvector-enabled Postgres together
+├── requirements.txt
+└── .env.example                           # Template for your Groq API key
+```
 
-Now there's an actual webpage to demo instead of the `/docs` page.
+---
 
-### What's new
+## 🚀 Running it
 
-- `static/index.html` — a single self-contained chat page (HTML +
-  CSS + JavaScript all in one file, no build tools needed)
-- `main.py` — now has a route for `/` that serves this page
+**Requires:** [Docker Desktop](https://www.docker.com/products/docker-desktop/) and a free [Groq API key](https://console.groq.com/keys).
 
-### Try it
-
-1. Restart the server:
+1. **Clone the repo**
+   ```bash
+   git clone <your-repo-url>
+   cd support_agent
    ```
-   uvicorn main:app --reload
+
+2. **Add your Groq API key**
+
+   Copy `.env.example` to `.env` and fill in your key:
    ```
-2. Open your browser to:
+   GROQ_API_KEY=gsk_your_key_here
    ```
-   http://127.0.0.1:8000
-   ```
-   (no `/docs` needed this time — this IS the app)
-3. Type a message and hit Send or press Enter
 
-### How it works, simply
-
-The page's JavaScript sends whatever you type to your `/chat`
-endpoint (the exact same one you tested in `/docs`) using `fetch()`,
-then shows the reply as a chat bubble. It's the same AI agent from
-Steps 2-3 — just with a proper front door instead of the developer
-docs page.
-
-## What's next (Step 5 — optional / for later)
-
-The project is now a fully working, demoable AI agent. If you want
-to keep going for your portfolio:
-- Push it to GitHub with a clear README (screenshot of the chat UI
-  goes a long way)
-- Record a short demo video/gif
-- Optionally add: Docker (for deployment), a proper vector database
-  (pgvector or ChromaDB) instead of TF-IDF, or LangGraph if you want
-  to show multi-agent orchestration explicitly
-
-## Step 5: Docker (new!)
-
-Your app can now run inside a container — meaning anyone (or any
-server) can run it with just Docker installed, without needing
-Python, pip, or any of your dependencies set up on their machine.
-
-### What's new
-
-- `Dockerfile` — the "recipe" that packages your app into an image
-- `.dockerignore` — tells Docker which files to skip when building
-  (keeps secrets like `.env` out of the image, and keeps it lean)
-- `docker-compose.yml` — lets you start everything with one command
-
-### Before you start
-
-Make sure `support_agent.db` already exists in your project folder
-(run `python seed.py` locally once if it doesn't) and that your real
-`.env` file with your Groq key is there too. Docker needs both to
-already exist on your machine before it can hand them to the
-container.
-
-### Running it
-
-1. Install [Docker Desktop](https://www.docker.com/products/docker-desktop/)
-   if you don't have it, and make sure it's running.
-2. In your project folder, run:
-   ```
+3. **Build and run everything** (app + Postgres, in one command)
+   ```bash
    docker compose up --build
    ```
-3. The first run will take a minute or two (downloading the base
-   Python image, installing dependencies). You'll see logs ending
-   in something like `Uvicorn running on http://0.0.0.0:8000`.
-4. Open your browser to:
-   ```
-   http://localhost:8000
-   ```
-   Same chat UI, same agent — just running inside a container now.
-5. To stop it, press `Ctrl+C`, or run `docker compose down` in
-   another terminal.
+   First run takes a few minutes (downloading dependencies + the embedding model). Subsequent runs are fast.
 
-### What actually happened, in plain words
+4. **Open the app**
 
-- Docker read the `Dockerfile` and built an **image**: a snapshot
-  containing Python, your dependencies, and your code, all bundled
-  together.
-- `docker compose up` started a **container**: a running instance of
-  that image, isolated from the rest of your computer.
-- Your `.env` file was injected into the container (so it still has
-  your Groq key) without that file ever being baked into the image
-  itself — good practice, since images are often shared/pushed
-  publicly and you never want secrets inside them.
-- Your database file is "mounted" from your real computer into the
-  container, so your order data doesn't disappear when the container
-  stops.
+   Go to [http://localhost:8000](http://localhost:8000) and try:
+   - *"where is my order 4582?"*
+   - *"what happens if my package shows up broken?"*
+   - *"how much does shipping cost?"*
 
-### Why this matters for your portfolio
+---
 
-This is the actual first step toward **deploying** the project
-somewhere real (Render, Railway, AWS, etc.) — almost all hosting
-platforms expect a Dockerized app rather than "here's my Python
-files, please figure out how to run them."
+## 🎯 What this project demonstrates
 
-## Step 6: Real vector database with pgvector (new!)
+- Designing **AI tools/functions** so an LLM takes grounded actions instead of hallucinating
+- **Graph-based agent orchestration** with LangGraph (state graphs, conditional routing, tool nodes)
+- A real **RAG pipeline** with actual embeddings and a production-grade vector store (pgvector), not just keyword search
+- **Containerized, multi-service deployment** with Docker Compose
+- End-to-end ownership: database → agent logic → vector search → API → UI
+- Real debugging across the stack: Docker networking issues, database connection ordering bugs, and LLM tool-naming quirks — see [BUILD_LOG.md](BUILD_LOG.md) for the actual troubleshooting process
 
-The policy search now uses REAL semantic embeddings stored in
-PostgreSQL (via the pgvector extension), replacing the earlier
-TF-IDF keyword-matching version.
+---
 
-### What actually changed
+## 🔭 Possible next steps
 
-- **Before (TF-IDF):** matched questions to policy text based on
-  shared *words*. "How much does shipping cost?" vs. "shipping
-  price" could rank oddly because "cost" and "price" look unrelated
-  to word-matching.
-- **Now (embeddings + pgvector):** each policy chunk and each
-  question gets converted into a list of 384 numbers (via a
-  HuggingFace model, `all-MiniLM-L6-v2`) that captures its *meaning*.
-  Similar meanings end up with similar numbers, even with completely
-  different words. Those numbers are stored in Postgres using the
-  pgvector extension and searched with real vector similarity
-  (cosine distance) — the same category of tool as ChromaDB, just
-  built into Postgres.
-- The old version is kept as `rag_tfidf_backup.py` in case you ever
-  want to compare the two or revert.
+- Deploy it live (Render, Railway, Fly.io) for a shareable public link
+- Extend the LangGraph graph into true multiple specialist agents (a Supervisor node routing to separate Order and Policy agent nodes)
+- Add observability/tracing (Langfuse or LangSmith)
+- Swap SQLite for PostgreSQL for the orders table too, for a single unified database
 
-### What's new in the project
 
-- `docker-compose.yml` now runs **two** containers: your app, and a
-  `pgvector/pgvector:pg16` Postgres database
-- `rag.py` was rewritten to embed text and query pgvector instead of
-  using scikit-learn's TF-IDF
-- `requirements.txt` swapped `scikit-learn` for `sentence-transformers`,
-  `psycopg2-binary`, and `pgvector`
-
-### Running it
-
-Since everything now runs through Docker Compose (app + database
-together), just run:
-```
-docker compose up --build
-```
-
-**Heads up on the first run:** this will take noticeably longer than
-before — `sentence-transformers` pulls in a much larger dependency
-(PyTorch) than scikit-learn did, and the embedding model itself
-(~90MB) downloads the first time the container starts. Both are
-cached after that (the model via the `hf_cache` volume), so
-subsequent restarts are fast.
-
-Try the same test questions as before:
-```
-can I return an item after 20 days?
-how much does shipping cost?
-my order arrived damaged, what should I do?
-```
-The answers should look similar, but they're now being found through
-real semantic search rather than word overlap.
-
-### An honest note on testing
-
-I verified the code's structure carefully — the SQL, the pgvector
-library calls, and the overall logic are all correct and follow the
-standard pattern for this setup. I could not fully run this
-end-to-end in my own environment the way I did for earlier steps,
-since it needs a live Postgres server and an internet connection to
-download the embedding model, neither of which I have here. You'll
-be the first real test — if anything errors on your machine, paste
-me the exact output and we'll debug it together, the same way we did
-for every step before this.
-
-## Step 7: LangGraph orchestration (new!)
-
-The agent's "decide whether to use a tool, then loop until done"
-logic is now an actual **graph** (via LangGraph) instead of a
-hand-written loop.
-
-### What changed
-
-- **Before:** `chat.py` had a manual Python loop: ask the LLM, check
-  if it wants a tool, run the tool if so, ask again, repeat.
-- **Now:** that same behavior is expressed as an explicit graph with
-  two nodes — `agent` (asks the LLM what to do) and `tools` (runs
-  whichever tool was requested) — connected by edges, including a
-  conditional edge that decides "keep going" vs. "we're done."
-
-```
-START ──► [agent] ──(needs a tool?)──► [tools] ──► back to [agent]
-              │
-              └──(no, just answer)──► END
-```
-
-- The old manual-loop version is kept as `chat_manual_backup.py` for
-  comparison.
-- Functionally, the agent behaves the same as before — same tools,
-  same answers. What's different is *how it's built*: as a proper,
-  inspectable state graph rather than an implicit loop.
-
-### Why this matters for your portfolio
-
-A hand-rolled loop works fine for one agent with two tools, but it
-doesn't scale cleanly. LangGraph is built for exactly the case where
-you'd want to grow this into multiple specialist agents (e.g. a
-Supervisor that routes between a dedicated Order Agent and a
-dedicated Policy Agent) — the graph structure is what makes that
-extension straightforward later, without a rewrite.
-
-### Running it
-
-No new setup needed beyond installing the new dependencies:
-```
-docker compose up --build
-```
-
-Try the same test questions as before — the behavior should be
-identical, just running through the new graph under the hood.
-
-### An honest note on testing
-
-I verified the graph builds and wires together correctly — I
-actually ran the tool-building and graph-compilation code and
-confirmed the exact structure (`agent` → `tools` → back to `agent`,
-with the right conditional routing) matches the design. What I
-couldn't test from here is the final live call to Groq, since that
-needs your real API key and internet access this environment doesn't
-have. That part should just work, following the same pattern as
-before, but you'll be the one confirming the full conversation end
-to end.
-
-## What's next (Step 8 — optional)
-
-- Actually deploying it live somewhere so you have a shareable link
-- Extending the graph into true multiple specialist agents (a real
-  Supervisor + Order Agent + Policy Agent, each as its own node)
