@@ -185,6 +185,196 @@ to keep going for your portfolio:
   (pgvector or ChromaDB) instead of TF-IDF, or LangGraph if you want
   to show multi-agent orchestration explicitly
 
-None of those are required — what you have right now is already a
-complete, working, three-skill project (tool-calling AI agent + RAG
-+ real database) that's genuinely demoable.
+## Step 5: Docker (new!)
+
+Your app can now run inside a container — meaning anyone (or any
+server) can run it with just Docker installed, without needing
+Python, pip, or any of your dependencies set up on their machine.
+
+### What's new
+
+- `Dockerfile` — the "recipe" that packages your app into an image
+- `.dockerignore` — tells Docker which files to skip when building
+  (keeps secrets like `.env` out of the image, and keeps it lean)
+- `docker-compose.yml` — lets you start everything with one command
+
+### Before you start
+
+Make sure `support_agent.db` already exists in your project folder
+(run `python seed.py` locally once if it doesn't) and that your real
+`.env` file with your Groq key is there too. Docker needs both to
+already exist on your machine before it can hand them to the
+container.
+
+### Running it
+
+1. Install [Docker Desktop](https://www.docker.com/products/docker-desktop/)
+   if you don't have it, and make sure it's running.
+2. In your project folder, run:
+   ```
+   docker compose up --build
+   ```
+3. The first run will take a minute or two (downloading the base
+   Python image, installing dependencies). You'll see logs ending
+   in something like `Uvicorn running on http://0.0.0.0:8000`.
+4. Open your browser to:
+   ```
+   http://localhost:8000
+   ```
+   Same chat UI, same agent — just running inside a container now.
+5. To stop it, press `Ctrl+C`, or run `docker compose down` in
+   another terminal.
+
+### What actually happened, in plain words
+
+- Docker read the `Dockerfile` and built an **image**: a snapshot
+  containing Python, your dependencies, and your code, all bundled
+  together.
+- `docker compose up` started a **container**: a running instance of
+  that image, isolated from the rest of your computer.
+- Your `.env` file was injected into the container (so it still has
+  your Groq key) without that file ever being baked into the image
+  itself — good practice, since images are often shared/pushed
+  publicly and you never want secrets inside them.
+- Your database file is "mounted" from your real computer into the
+  container, so your order data doesn't disappear when the container
+  stops.
+
+### Why this matters for your portfolio
+
+This is the actual first step toward **deploying** the project
+somewhere real (Render, Railway, AWS, etc.) — almost all hosting
+platforms expect a Dockerized app rather than "here's my Python
+files, please figure out how to run them."
+
+## Step 6: Real vector database with pgvector (new!)
+
+The policy search now uses REAL semantic embeddings stored in
+PostgreSQL (via the pgvector extension), replacing the earlier
+TF-IDF keyword-matching version.
+
+### What actually changed
+
+- **Before (TF-IDF):** matched questions to policy text based on
+  shared *words*. "How much does shipping cost?" vs. "shipping
+  price" could rank oddly because "cost" and "price" look unrelated
+  to word-matching.
+- **Now (embeddings + pgvector):** each policy chunk and each
+  question gets converted into a list of 384 numbers (via a
+  HuggingFace model, `all-MiniLM-L6-v2`) that captures its *meaning*.
+  Similar meanings end up with similar numbers, even with completely
+  different words. Those numbers are stored in Postgres using the
+  pgvector extension and searched with real vector similarity
+  (cosine distance) — the same category of tool as ChromaDB, just
+  built into Postgres.
+- The old version is kept as `rag_tfidf_backup.py` in case you ever
+  want to compare the two or revert.
+
+### What's new in the project
+
+- `docker-compose.yml` now runs **two** containers: your app, and a
+  `pgvector/pgvector:pg16` Postgres database
+- `rag.py` was rewritten to embed text and query pgvector instead of
+  using scikit-learn's TF-IDF
+- `requirements.txt` swapped `scikit-learn` for `sentence-transformers`,
+  `psycopg2-binary`, and `pgvector`
+
+### Running it
+
+Since everything now runs through Docker Compose (app + database
+together), just run:
+```
+docker compose up --build
+```
+
+**Heads up on the first run:** this will take noticeably longer than
+before — `sentence-transformers` pulls in a much larger dependency
+(PyTorch) than scikit-learn did, and the embedding model itself
+(~90MB) downloads the first time the container starts. Both are
+cached after that (the model via the `hf_cache` volume), so
+subsequent restarts are fast.
+
+Try the same test questions as before:
+```
+can I return an item after 20 days?
+how much does shipping cost?
+my order arrived damaged, what should I do?
+```
+The answers should look similar, but they're now being found through
+real semantic search rather than word overlap.
+
+### An honest note on testing
+
+I verified the code's structure carefully — the SQL, the pgvector
+library calls, and the overall logic are all correct and follow the
+standard pattern for this setup. I could not fully run this
+end-to-end in my own environment the way I did for earlier steps,
+since it needs a live Postgres server and an internet connection to
+download the embedding model, neither of which I have here. You'll
+be the first real test — if anything errors on your machine, paste
+me the exact output and we'll debug it together, the same way we did
+for every step before this.
+
+## Step 7: LangGraph orchestration (new!)
+
+The agent's "decide whether to use a tool, then loop until done"
+logic is now an actual **graph** (via LangGraph) instead of a
+hand-written loop.
+
+### What changed
+
+- **Before:** `chat.py` had a manual Python loop: ask the LLM, check
+  if it wants a tool, run the tool if so, ask again, repeat.
+- **Now:** that same behavior is expressed as an explicit graph with
+  two nodes — `agent` (asks the LLM what to do) and `tools` (runs
+  whichever tool was requested) — connected by edges, including a
+  conditional edge that decides "keep going" vs. "we're done."
+
+```
+START ──► [agent] ──(needs a tool?)──► [tools] ──► back to [agent]
+              │
+              └──(no, just answer)──► END
+```
+
+- The old manual-loop version is kept as `chat_manual_backup.py` for
+  comparison.
+- Functionally, the agent behaves the same as before — same tools,
+  same answers. What's different is *how it's built*: as a proper,
+  inspectable state graph rather than an implicit loop.
+
+### Why this matters for your portfolio
+
+A hand-rolled loop works fine for one agent with two tools, but it
+doesn't scale cleanly. LangGraph is built for exactly the case where
+you'd want to grow this into multiple specialist agents (e.g. a
+Supervisor that routes between a dedicated Order Agent and a
+dedicated Policy Agent) — the graph structure is what makes that
+extension straightforward later, without a rewrite.
+
+### Running it
+
+No new setup needed beyond installing the new dependencies:
+```
+docker compose up --build
+```
+
+Try the same test questions as before — the behavior should be
+identical, just running through the new graph under the hood.
+
+### An honest note on testing
+
+I verified the graph builds and wires together correctly — I
+actually ran the tool-building and graph-compilation code and
+confirmed the exact structure (`agent` → `tools` → back to `agent`,
+with the right conditional routing) matches the design. What I
+couldn't test from here is the final live call to Groq, since that
+needs your real API key and internet access this environment doesn't
+have. That part should just work, following the same pattern as
+before, but you'll be the one confirming the full conversation end
+to end.
+
+## What's next (Step 8 — optional)
+
+- Actually deploying it live somewhere so you have a shareable link
+- Extending the graph into true multiple specialist agents (a real
+  Supervisor + Order Agent + Policy Agent, each as its own node)

@@ -1,0 +1,52 @@
+# docker-compose.yml lets you start the whole app with ONE command
+# instead of a long "docker run" command with lots of flags.
+#
+# Run it with:  docker compose up --build
+#
+# There are now TWO services:
+#   1. db             — a PostgreSQL database with the pgvector
+#                        extension, used to store policy embeddings
+#   2. support-agent   — your actual FastAPI app
+
+services:
+
+  db:
+    image: pgvector/pgvector:pg16   # official Postgres + pgvector, ready to use
+    environment:
+      POSTGRES_USER: raguser
+      POSTGRES_PASSWORD: ragpass
+      POSTGRES_DB: policies
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data   # keeps your vector data between restarts
+    healthcheck:
+      # Lets docker-compose know when Postgres is actually ready to
+      # accept connections, not just "started" — the app waits for
+      # this before trying to connect.
+      test: ["CMD-SHELL", "pg_isready -U raguser -d policies"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  support-agent:
+    build: .
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env                        # loads your GROQ_API_KEY (secret, stays out of compose file)
+    environment:
+      # Tells the app how to reach the "db" service above. "db" works
+      # as a hostname here because Docker Compose sets up internal
+      # networking between services automatically.
+      DATABASE_URL: postgresql://raguser:ragpass@db:5432/policies
+    depends_on:
+      db:
+        condition: service_healthy   # wait for Postgres to be ready first
+    volumes:
+      - ./support_agent.db:/app/support_agent.db   # your orders database
+      - hf_cache:/root/.cache/huggingface           # caches the embedding model so it's not re-downloaded every restart
+
+volumes:
+  pgdata:
+  hf_cache:

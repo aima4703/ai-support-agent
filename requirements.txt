@@ -3,4 +3,9 @@ uvicorn
 sqlalchemy
 groq
 python-dotenv
-scikit-learn
+psycopg2-binary
+pgvector
+sentence-transformers
+langgraph
+langchain-core
+langchain-groq

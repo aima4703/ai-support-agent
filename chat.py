@@ -1,28 +1,51 @@
 """
-This is where the "AI decides what to do" part happens.
+This is the LangGraph version of the agent — it replaces the manual
+tool-calling loop from before (kept as chat_manual_backup.py) with an
+actual GRAPH: a small state machine with nodes and edges.
 
-The flow, in plain words:
-1. We send the user's message to Groq, along with a "menu" of tools
-   it's allowed to use (right now, just lookup_order).
-2. Groq reads the message and decides: does this need a tool, or can
-   I just answer directly?
-3. If it wants a tool, it tells us WHICH one and WITH WHAT arguments
-   (e.g. "call lookup_order with order_id=4582"). We run that
-   function ourselves — Groq never touches your database directly.
-4. We send the tool's result back to Groq, and it writes a normal,
-   friendly sentence using that information.
+Why this matters, in plain words:
+
+The previous version worked, but the "keep calling tools until done"
+logic was a hand-written while-loop. That's fine for one agent with
+two tools, but it doesn't scale well — if you wanted multiple
+specialist agents (an Order Agent, a Policy Agent, a Supervisor that
+routes between them), you'd end up reinventing a lot of bookkeeping
+by hand.
+
+LangGraph gives you that bookkeeping for free, expressed as an
+actual graph:
+
+    START ──► [agent] ──► (does it want to use a tool?)
+                 ▲               │
+                 │          yes  │  no
+                 │               ▼        ▼
+                 └────────── [tools]     END
+
+- The "agent" node calls the LLM and asks: "given the conversation
+  so far, what should happen next?"
+- If the LLM's answer includes a tool call, we go to the "tools"
+  node, which actually runs the function, then loops back to "agent"
+  so the LLM can see the result and decide what to do next.
+- If the LLM's answer is just a normal reply (no tool call), we go
+  to END and return that as the final answer.
+
+This is the same overall behavior as before — the AI still decides
+for itself whether it needs a tool — just expressed as an explicit,
+inspectable graph instead of an implicit loop.
 """
 
 import os
-import json
-from groq import Groq
 from sqlalchemy.orm import Session
 
-from tools import lookup_order, search_policy, TOOLS_SCHEMA
+from langchain_core.tools import tool
+from langchain_core.messages import SystemMessage, HumanMessage
+from langchain_groq import ChatGroq
+from langgraph.graph import StateGraph, MessagesState, START, END
+from langgraph.prebuilt import ToolNode
 
-client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
+from tools import lookup_order, search_policy
 
-MODEL = "openai/gpt-oss-120b"  # same model family you used in PolicyBot
+MODEL = "openai/gpt-oss-120b"  # same model you used before
 
 SYSTEM_PROMPT = (
     "You are a helpful customer support assistant for an online store. "
@@ -34,51 +57,85 @@ SYSTEM_PROMPT = (
 )
 
 
-def chat_with_agent(user_message: str, db: Session) -> str:
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": user_message},
-    ]
+def _build_tools_for_this_request(db: Session):
+    """
+    Wraps our existing plain Python functions (from tools.py) as
+    LangGraph-compatible tools.
 
-    # Step 1: ask Groq what it wants to do
-    response = client.chat.completions.create(
-        model=MODEL,
-        messages=messages,
-        tools=TOOLS_SCHEMA,
+    Why a function that builds tools per-request, instead of just
+    defining them once at the top of the file? Because lookup_order
+    needs a database SESSION, and each web request gets its own
+    fresh session (see database.py's get_db). Building the tools
+    fresh for each request is the simplest way to hand that
+    request's session to the tool without using global variables —
+    the trade-off is a little more setup work per request, which is
+    a fine trade for a learning project like this one.
+    """
+
+    # IMPORTANT: we explicitly name each tool with @tool("exact_name")
+    # instead of letting it default to the Python function's name.
+    # Without this, the tool would be named "search_policy_tool" (the
+    # function's name), but it turns out this particular model
+    # sometimes generates a call to "search_policy" (no "_tool"
+    # suffix) regardless of what we called it — Groq's API then
+    # rejects the call because that exact name wasn't registered.
+    # Naming it explicitly to match what the model actually generates
+    # fixes this validation error.
+
+    @tool("lookup_order")
+    def lookup_order_tool(order_id: int) -> dict:
+        """Look up an order's status, product, and delivery info by its order ID number."""
+        return lookup_order(order_id=order_id, db=db)
+
+    @tool("search_policy")
+    def search_policy_tool(query: str) -> dict:
+        """Search the store's return, refund, and shipping policy documents to answer questions about return windows, refund eligibility, or shipping costs and times."""
+        return search_policy(query=query)
+
+    return [lookup_order_tool, search_policy_tool]
+
+
+def _build_graph(tools):
+    """Builds and compiles the actual LangGraph graph described above."""
+
+    llm = ChatGroq(model=MODEL, api_key=os.environ.get("GROQ_API_KEY"))
+    llm_with_tools = llm.bind_tools(tools)
+
+    def call_model(state: MessagesState):
+        """The 'agent' node: ask the LLM what to do next."""
+        response = llm_with_tools.invoke(state["messages"])
+        return {"messages": [response]}
+
+    def should_continue(state: MessagesState):
+        """Decides which edge to follow after the agent node runs."""
+        last_message = state["messages"][-1]
+        if last_message.tool_calls:
+            return "tools"
+        return END
+
+    graph = StateGraph(MessagesState)
+    graph.add_node("agent", call_model)
+    graph.add_node("tools", ToolNode(tools))
+
+    graph.add_edge(START, "agent")
+    graph.add_conditional_edges("agent", should_continue, {"tools": "tools", END: END})
+    graph.add_edge("tools", "agent")  # after using a tool, go back and let the AI respond
+
+    return graph.compile()
+
+
+def chat_with_agent(user_message: str, db: Session) -> str:
+    tools = _build_tools_for_this_request(db)
+    app = _build_graph(tools)
+
+    result = app.invoke(
+        {
+            "messages": [
+                SystemMessage(content=SYSTEM_PROMPT),
+                HumanMessage(content=user_message),
+            ]
+        }
     )
 
-    reply = response.choices[0].message
-
-    # Step 2: did the AI ask to use a tool?
-    if reply.tool_calls:
-        # Add the AI's tool request to the conversation history
-        messages.append(reply)
-
-        for tool_call in reply.tool_calls:
-            args = json.loads(tool_call.function.arguments)
-
-            if tool_call.function.name == "lookup_order":
-                result = lookup_order(order_id=args["order_id"], db=db)
-            elif tool_call.function.name == "search_policy":
-                result = search_policy(query=args["query"])
-            else:
-                result = {"error": "Unknown tool requested"}
-
-            # Step 3: give the tool's result back to Groq
-            messages.append(
-                {
-                    "role": "tool",
-                    "tool_call_id": tool_call.id,
-                    "content": json.dumps(result),
-                }
-            )
-
-        # Step 4: ask Groq to write the final, human-friendly answer
-        final_response = client.chat.completions.create(
-            model=MODEL,
-            messages=messages,
-        )
-        return final_response.choices[0].message.content
-
-    # No tool needed — the AI answered directly (e.g. "hello!")
-    return reply.content
+    final_message = result["messages"][-1]
+    return final_message.content
